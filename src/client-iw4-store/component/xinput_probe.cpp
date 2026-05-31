@@ -1,6 +1,8 @@
 #include "common.hpp"
 
 #include "component/scheduler.hpp"
+#include "component/settings.hpp"
+#include "game/game.hpp"
 
 #include <loader/component_loader.hpp>
 
@@ -9,9 +11,6 @@
 namespace xinput_probe {
 	namespace {
 		using xinput_get_state_t = DWORD(WINAPI*)(DWORD, XINPUT_STATE*);
-
-		constexpr float mouse_sensitivity = 18.0f;
-		constexpr float stick_key_press_threshold = 0.35f;
 
 		constexpr std::array<const char*, 3> xinput_dll_names{
 			"xinput1_4.dll",
@@ -36,41 +35,14 @@ namespace xinput_probe {
 			std::pair{XINPUT_GAMEPAD_Y, "Y"},
 		};
 
-		constexpr std::array<WORD, 4> left_stick_keys{
-			'W',
-			'S',
-			'A',
-			'D',
-		};
-
-		constexpr std::array<WORD, 8> face_button_keys{
-			VK_SPACE, // A -> Jump
-			'C',      // B -> Crouch / prone hold
-			'R',      // X -> Reload
-			'2',      // Y -> Weapon swap
-			'Q',      // LB -> Tactical
-			'G',      // RB -> Grenade
-			'T',      // START -> Push-to-talk
-			VK_TAB,   // BACK -> Scoreboard
-		};
-
-		constexpr std::array<WORD, 4> dpad_keys{
-			'3',      // Up -> Killstreak 1
-			'4',      // Right -> Killstreak 2
-			'5',      // Down -> Killstreak 3
-			'6',      // Left -> Killstreak 4
-		};
-
-		constexpr std::array<WORD, 2> stick_button_keys{
-			VK_LSHIFT, // L3 -> Sprint
-			'V',       // R3 -> Melee
-		};
-
 		struct injected_state {
-			std::array<bool, left_stick_keys.size()> left_stick_keys_down{};
-			std::array<bool, face_button_keys.size()> face_button_keys_down{};
-			std::array<bool, dpad_keys.size()> dpad_keys_down{};
-			std::array<bool, stick_button_keys.size()> stick_button_keys_down{};
+			std::array<bool, 4> left_stick_keys_down{};
+			std::array<bool, 7> face_button_keys_down{};
+			std::array<bool, 4> dpad_keys_down{};
+			std::array<bool, 2> stick_button_keys_down{};
+			bool b_button_down{};
+			bool b_hold_mode{};
+			std::chrono::steady_clock::time_point b_pressed_at{};
 			bool left_mouse_down{};
 			bool right_mouse_down{};
 			float mouse_x_remainder{};
@@ -94,6 +66,8 @@ namespace xinput_probe {
 			xinput_get_state_t get_state{};
 			std::array<pad_snapshot, XUSER_MAX_COUNT> pads{};
 			bool initialized{};
+			bool overlay_visible{};
+			bool f11_down{};
 			DWORD active_index{XUSER_MAX_COUNT};
 			injected_state injected{};
 		};
@@ -111,7 +85,7 @@ namespace xinput_probe {
 			return foreground_process_id == GetCurrentProcessId();
 		}
 
-		bool any_pressed(const std::array<bool, left_stick_keys.size()>& keys) {
+		bool any_pressed(const std::array<bool, 4>& keys) {
 			for (const auto key_down : keys) {
 				if (key_down) {
 					return true;
@@ -179,40 +153,49 @@ namespace xinput_probe {
 			return std::clamp(normalized, 0.0f, 1.0f) * (value < 0 ? -1.0f : 1.0f);
 		}
 
-		void set_key_state(std::array<bool, left_stick_keys.size()>& state, const std::size_t index, const bool down) {
+		void set_key_state(std::array<bool, 4>& state, const std::size_t index, const bool down) {
 			if (state[index] == down) {
 				return;
 			}
 
 			state[index] = down;
-			send_key_event(left_stick_keys[index], down);
+			send_key_event(settings::get().left_stick_keys[index], down);
 		}
 
-		void set_button_state(std::array<bool, face_button_keys.size()>& state, const std::size_t index, const bool down) {
+		void set_button_state(std::array<bool, 7>& state, const std::size_t index, const bool down) {
 			if (state[index] == down) {
 				return;
 			}
 
 			state[index] = down;
-			send_key_event(face_button_keys[index], down);
+			send_key_event(settings::get().face_button_keys[index], down);
 		}
 
-		void set_button_state(std::array<bool, dpad_keys.size()>& state, const std::size_t index, const bool down) {
+		void set_button_state(std::array<bool, 4>& state, const std::size_t index, const bool down) {
 			if (state[index] == down) {
 				return;
 			}
 
 			state[index] = down;
-			send_key_event(dpad_keys[index], down);
+			send_key_event(settings::get().dpad_keys[index], down);
 		}
 
-		void set_button_state(std::array<bool, stick_button_keys.size()>& state, const std::size_t index, const bool down) {
+		void set_button_state(std::array<bool, 2>& state, const std::size_t index, const bool down) {
 			if (state[index] == down) {
 				return;
 			}
 
 			state[index] = down;
-			send_key_event(stick_button_keys[index], down);
+			send_key_event(settings::get().stick_button_keys[index], down);
+		}
+
+		void set_b_button_hold(const bool down) {
+			send_key_event(VK_CONTROL, down);
+		}
+
+		void set_b_button_tap() {
+			send_key_event('C', true);
+			send_key_event('C', false);
 		}
 
 		void release_all_inputs(injected_state& injected) {
@@ -231,6 +214,14 @@ namespace xinput_probe {
 			for (std::size_t i = 0; i < injected.stick_button_keys_down.size(); ++i) {
 				set_button_state(injected.stick_button_keys_down, i, false);
 			}
+
+			if (injected.b_hold_mode) {
+				set_b_button_hold(false);
+			}
+
+			injected.b_button_down = false;
+			injected.b_hold_mode = false;
+			injected.b_pressed_at = {};
 
 			if (injected.left_mouse_down) {
 				injected.left_mouse_down = false;
@@ -313,6 +304,41 @@ namespace xinput_probe {
 				gp.bRightTrigger);
 		}
 
+		void update_b_button(injected_state& injected, const bool b_down) {
+			constexpr auto hold_threshold = 180ms;
+			const auto now = std::chrono::steady_clock::now();
+
+			if (b_down) {
+				if (!injected.b_button_down) {
+					injected.b_button_down = true;
+					injected.b_hold_mode = false;
+					injected.b_pressed_at = now;
+				}
+
+				if (!injected.b_hold_mode && (now - injected.b_pressed_at) >= hold_threshold) {
+					injected.b_hold_mode = true;
+					set_b_button_hold(true);
+				}
+
+				return;
+			}
+
+			if (!injected.b_button_down) {
+				return;
+			}
+
+			if (injected.b_hold_mode) {
+				set_b_button_hold(false);
+			}
+			else {
+				set_b_button_tap();
+			}
+
+			injected.b_button_down = false;
+			injected.b_hold_mode = false;
+			injected.b_pressed_at = {};
+		}
+
 		void apply_active_controller(const DWORD index, const XINPUT_STATE& state) {
 			auto& injected = cache.injected;
 			const auto& gp = state.Gamepad;
@@ -322,19 +348,18 @@ namespace xinput_probe {
 			const auto right_x = normalize_thumb_axis(gp.sThumbRX, XINPUT_GAMEPAD_RIGHT_THUMB_DEADZONE);
 			const auto right_y = normalize_thumb_axis(gp.sThumbRY, XINPUT_GAMEPAD_RIGHT_THUMB_DEADZONE);
 
-			set_key_state(injected.left_stick_keys_down, 0, left_y > stick_key_press_threshold);
-			set_key_state(injected.left_stick_keys_down, 1, left_y < -stick_key_press_threshold);
-			set_key_state(injected.left_stick_keys_down, 2, left_x < -stick_key_press_threshold);
-			set_key_state(injected.left_stick_keys_down, 3, left_x > stick_key_press_threshold);
+			set_key_state(injected.left_stick_keys_down, 0, left_y > settings::get().stick_key_press_threshold);
+			set_key_state(injected.left_stick_keys_down, 1, left_y < -settings::get().stick_key_press_threshold);
+			set_key_state(injected.left_stick_keys_down, 2, left_x < -settings::get().stick_key_press_threshold);
+			set_key_state(injected.left_stick_keys_down, 3, left_x > settings::get().stick_key_press_threshold);
 
 			set_button_state(injected.face_button_keys_down, 0, (gp.wButtons & XINPUT_GAMEPAD_A) != 0);
-			set_button_state(injected.face_button_keys_down, 1, (gp.wButtons & XINPUT_GAMEPAD_B) != 0);
-			set_button_state(injected.face_button_keys_down, 2, (gp.wButtons & XINPUT_GAMEPAD_X) != 0);
-			set_button_state(injected.face_button_keys_down, 3, (gp.wButtons & XINPUT_GAMEPAD_Y) != 0);
-			set_button_state(injected.face_button_keys_down, 4, (gp.wButtons & XINPUT_GAMEPAD_LEFT_SHOULDER) != 0);
-			set_button_state(injected.face_button_keys_down, 5, (gp.wButtons & XINPUT_GAMEPAD_RIGHT_SHOULDER) != 0);
-			set_button_state(injected.face_button_keys_down, 6, (gp.wButtons & XINPUT_GAMEPAD_START) != 0);
-			set_button_state(injected.face_button_keys_down, 7, (gp.wButtons & XINPUT_GAMEPAD_BACK) != 0);
+			set_button_state(injected.face_button_keys_down, 1, (gp.wButtons & XINPUT_GAMEPAD_X) != 0);
+			set_button_state(injected.face_button_keys_down, 2, (gp.wButtons & XINPUT_GAMEPAD_Y) != 0);
+			set_button_state(injected.face_button_keys_down, 3, (gp.wButtons & XINPUT_GAMEPAD_LEFT_SHOULDER) != 0);
+			set_button_state(injected.face_button_keys_down, 4, (gp.wButtons & XINPUT_GAMEPAD_RIGHT_SHOULDER) != 0);
+			set_button_state(injected.face_button_keys_down, 5, (gp.wButtons & XINPUT_GAMEPAD_START) != 0);
+			set_button_state(injected.face_button_keys_down, 6, (gp.wButtons & XINPUT_GAMEPAD_BACK) != 0);
 
 			set_button_state(injected.stick_button_keys_down, 0, (gp.wButtons & XINPUT_GAMEPAD_LEFT_THUMB) != 0);
 			set_button_state(injected.stick_button_keys_down, 1, (gp.wButtons & XINPUT_GAMEPAD_RIGHT_THUMB) != 0);
@@ -343,6 +368,7 @@ namespace xinput_probe {
 			set_button_state(injected.dpad_keys_down, 1, (gp.wButtons & XINPUT_GAMEPAD_DPAD_RIGHT) != 0);
 			set_button_state(injected.dpad_keys_down, 2, (gp.wButtons & XINPUT_GAMEPAD_DPAD_DOWN) != 0);
 			set_button_state(injected.dpad_keys_down, 3, (gp.wButtons & XINPUT_GAMEPAD_DPAD_LEFT) != 0);
+			update_b_button(injected, (gp.wButtons & XINPUT_GAMEPAD_B) != 0);
 
 			// Map triggers: RT -> Left mouse (fire), LT -> Right mouse (aim)
 			const bool right_trigger_down = gp.bRightTrigger > XINPUT_GAMEPAD_TRIGGER_THRESHOLD;
@@ -357,7 +383,7 @@ namespace xinput_probe {
 				send_mouse_button_event(MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, left_trigger_down);
 			}
 
-			const auto mouse_scale = mouse_sensitivity * 10.0f;
+			const auto mouse_scale = settings::get().mouse_sensitivity * 10.0f;
 			send_mouse_move(injected.mouse_x_remainder, injected.mouse_y_remainder, right_x * mouse_scale, -right_y * mouse_scale);
 
 			if (cache.active_index != index) {
@@ -374,7 +400,7 @@ namespace xinput_probe {
 			if (!is_game_window_active()) {
 				if (cache.active_index != XUSER_MAX_COUNT || any_pressed(cache.injected.left_stick_keys_down) || any_pressed(cache.injected.face_button_keys_down) ||
 					any_pressed(cache.injected.dpad_keys_down) || any_pressed(cache.injected.stick_button_keys_down) ||
-					cache.injected.left_mouse_down || cache.injected.right_mouse_down) {
+					cache.injected.b_button_down || cache.injected.left_mouse_down || cache.injected.right_mouse_down) {
 					release_all_inputs(cache.injected);
 					cache.active_index = XUSER_MAX_COUNT;
 				}
@@ -431,7 +457,7 @@ namespace xinput_probe {
 			if (active_index == XUSER_MAX_COUNT) {
 				if (cache.active_index != XUSER_MAX_COUNT || any_pressed(cache.injected.left_stick_keys_down) || any_pressed(cache.injected.face_button_keys_down) ||
 					any_pressed(cache.injected.dpad_keys_down) || any_pressed(cache.injected.stick_button_keys_down) ||
-					cache.injected.left_mouse_down || cache.injected.right_mouse_down) {
+					cache.injected.b_button_down || cache.injected.left_mouse_down || cache.injected.right_mouse_down) {
 					release_all_inputs(cache.injected);
 					cache.active_index = XUSER_MAX_COUNT;
 				}
@@ -444,7 +470,16 @@ namespace xinput_probe {
 			}
 
 			apply_active_controller(active_index, active_state);
+
+			const auto f11_now_down = (GetAsyncKeyState(VK_F11) & 0x8000) != 0;
+			if (f11_now_down && !cache.f11_down) {
+				cache.overlay_visible = !cache.overlay_visible;
+			}
+
+			cache.f11_down = f11_now_down;
 		}
+
+		void draw_overlay() {}
 	}
 
 	struct component final : generic_component {

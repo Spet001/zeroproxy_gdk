@@ -688,3 +688,4 @@ workspace "ZeroProxy"
 
 	group "Dependencies"
 		dependencies.projects()
+
