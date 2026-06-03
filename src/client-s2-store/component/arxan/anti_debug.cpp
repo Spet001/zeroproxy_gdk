@@ -37,7 +37,6 @@ namespace arxan::anti_debug
 		utils::hook::detour create_mutex_ex_a_hook;
 		utils::hook::detour create_thread_hook;
 		utils::hook::detour get_thread_context_hook;
-		utils::hook::detour virtual_alloc_hook;
 		utils::hook::detour check_remote_debugger_present_hook;
 		utils::hook::detour enum_windows_hook;
 
@@ -500,14 +499,21 @@ namespace arxan::anti_debug
 		{
 			void* address;
 			size_t size;
-			bool hooked;
+			bool is_single_stepping;
 		};
-
+		std::recursive_mutex ntdll_copies_mutex;
 		std::vector<ntdll_copy> ntdll_copies;
-		std::mutex ntdll_copies_mutex;
+		
+		struct SingleStepThread {
+			DWORD thread_id;
+			void* copy_address;
+		};
+		SingleStepThread single_stepping_threads[64]{};
 		uint64_t g_ntdll_base = 0;
+		using NtProtectVirtualMemory_t = NTSTATUS(NTAPI*)(HANDLE, PVOID*, PSIZE_T, ULONG, PULONG);
+		NtProtectVirtualMemory_t g_direct_NtProtectVirtualMemory = nullptr;
 
-		void hook_ntdll_copy(ntdll_copy& copy)
+		void hook_ntdll_copy(ntdll_copy copy)
 		{
 			const utils::nt::library ntdll("ntdll.dll");
 			const auto nt_close = ntdll.get_proc<std::uintptr_t>("NtClose");
@@ -560,27 +566,67 @@ namespace arxan::anti_debug
 		{
 			const auto rec = info->ExceptionRecord;
 
+			if (rec->ExceptionCode == 0x80000004 || rec->ExceptionCode == 0x40010006) // Single step
+			{
+				DWORD current_tid = GetCurrentThreadId();
+				for (int i = 0; i < 64; ++i)
+				{
+					if (single_stepping_threads[i].thread_id == current_tid)
+					{
+						void* step_copy = single_stepping_threads[i].copy_address;
+						single_stepping_threads[i].thread_id = 0;
+						
+						std::lock_guard<std::recursive_mutex> lock(ntdll_copies_mutex);
+  						for (size_t j = 0; j < ntdll_copies.size(); ++j)
+  						{
+  							auto& copy = ntdll_copies[j];
+  							if (copy.address == step_copy)
+  							{
+  								DWORD old_protect;
+  								PVOID base = copy.address;
+  								SIZE_T size = copy.size;
+  								if (g_direct_NtProtectVirtualMemory) g_direct_NtProtectVirtualMemory((HANDLE)-1, &base, &size, PAGE_READWRITE, &old_protect);
+  								copy.is_single_stepping = false;
+  								break;
+  							}
+  						}
+  						return EXCEPTION_CONTINUE_EXECUTION;
+					}
+				}
+			}
 			if (rec->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && rec->ExceptionInformation[0] == 8) // Execute fault
 			{
 				const auto fault_address = rec->ExceptionInformation[1];
 				
-				std::lock_guard<std::mutex> lock(ntdll_copies_mutex);
-				for (auto& copy : ntdll_copies)
-				{
+				std::lock_guard<std::recursive_mutex> lock(ntdll_copies_mutex);
+  				for (size_t j = 0; j < ntdll_copies.size(); ++j)
+  				{
+  					auto& copy = ntdll_copies[j];
 					if (fault_address >= reinterpret_cast<uint64_t>(copy.address) && fault_address < reinterpret_cast<uint64_t>(copy.address) + copy.size)
 					{
-						if (!copy.hooked)
+						if (copy.is_single_stepping)
 						{
-							LOG("Arxan/AntiDebug", INFO, "[VEH] Execute fault in unhooked NTDLL copy at {:X}. Hooking now...", fault_address);
-							
-							// Restore execution protection so the copy can run natively
-							DWORD old_protect;
-							VirtualProtect(copy.address, copy.size, PAGE_EXECUTE_READWRITE, &old_protect);
-							
-							hook_ntdll_copy(copy);
-							copy.hooked = true;
+							// Arxan caught our single-step execute fault??
+							return EXCEPTION_CONTINUE_EXECUTION;
 						}
-
+						
+						// Restore execution protection so the copy can run natively
+						DWORD old_protect;
+						PVOID base = copy.address;
+						SIZE_T size = copy.size;
+						if (g_direct_NtProtectVirtualMemory) g_direct_NtProtectVirtualMemory((HANDLE)-1, &base, &size, PAGE_EXECUTE_READWRITE, &old_protect);
+						
+						info->ContextRecord->EFlags |= 0x100; // Trap Flag
+						DWORD current_tid = GetCurrentThreadId();
+						for (int i = 0; i < 64; ++i) {
+							if (single_stepping_threads[i].thread_id == 0) {
+								single_stepping_threads[i].thread_id = current_tid;
+								single_stepping_threads[i].copy_address = copy.address;
+								break;
+							}
+						}
+						copy.is_single_stepping = true;
+						
 						return EXCEPTION_CONTINUE_EXECUTION;
 					}
 				}
@@ -594,20 +640,18 @@ namespace arxan::anti_debug
 			return EXCEPTION_CONTINUE_SEARCH;
 		}
 
+		utils::hook::detour virtual_alloc_hook;
+
 		LPVOID WINAPI virtual_alloc_stub(LPVOID address, SIZE_T size, DWORD allocation_type, DWORD protect)
 		{
-			if ((allocation_type & MEM_COMMIT) &&
-				protect == PAGE_EXECUTE_READWRITE &&
-				size > 0x100000 && size < 0x180000)
+			if ((allocation_type & MEM_COMMIT) && protect == PAGE_EXECUTE_READWRITE && size > 0x100000 && size < 0x180000)
 			{
 				LOG("Arxan/AntiDebug", INFO, "[VirtualAlloc] Intercepted NTDLL copy allocation - size: {:X}", size);
-
-				// Force protection to PAGE_READWRITE so we get an execute fault when Arxan tries to use it.
-				// This allows us to hook it exactly when it's fully populated and about to be executed.
+				
 				LPVOID allocated = virtual_alloc_hook.invoke<LPVOID>(address, size, allocation_type, PAGE_READWRITE);
 				if (allocated)
 				{
-					std::lock_guard<std::mutex> lock(ntdll_copies_mutex);
+					std::lock_guard<std::recursive_mutex> lock(ntdll_copies_mutex);
 					ntdll_copies.push_back({ allocated, size, false });
 					LOG("Arxan/AntiDebug", INFO, "[VirtualAlloc] Registered NTDLL copy at: {}", allocated);
 				}
@@ -654,6 +698,19 @@ namespace arxan::anti_debug
 		void post_load() override
 		{
 			g_ntdll_base = reinterpret_cast<uint64_t>(utils::nt::library("ntdll.dll").get_ptr());
+			
+			// Initialize global pointer for VEH with a direct syscall stub
+			uint8_t syscall_stub[] = {
+				0x4C, 0x8B, 0xD1,             // mov r10, rcx
+				0xB8, 0x50, 0x00, 0x00, 0x00, // mov eax, 50h
+				0x0F, 0x05,                   // syscall
+				0xC3                          // ret
+			};
+			void* tramp_ntprotect = VirtualAlloc(nullptr, 0x1000, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+			if (tramp_ntprotect) {
+				memcpy(tramp_ntprotect, syscall_stub, sizeof(syscall_stub));
+				g_direct_NtProtectVirtualMemory = reinterpret_cast<NtProtectVirtualMemory_t>(tramp_ntprotect);
+			}
 
 			auto* dll_characteristics = &utils::nt::library().get_optional_header()->DllCharacteristics;
 			utils::hook::set<WORD>(dll_characteristics, *dll_characteristics | IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE);
@@ -669,9 +726,9 @@ namespace arxan::anti_debug
 
 			AddVectoredExceptionHandler(1, exception_filter);
 
-			create_mutex_ex_a_hook.create(CreateMutexExA, create_mutex_ex_a_stub);
-			create_thread_hook.create(CreateThread, create_thread_stub);
-			enum_windows_hook.create(EnumWindows, enum_windows_stub);
+			// create_mutex_ex_a_hook.create(CreateMutexExA, create_mutex_ex_a_stub);
+			// create_thread_hook.create(CreateThread, create_thread_stub);
+			// enum_windows_hook.create(EnumWindows, enum_windows_stub);
 
 			const utils::nt::library ntdll("ntdll.dll");
 			nt_close_hook.create(ntdll.get_proc<void*>("NtClose"), nt_close_stub);
@@ -687,15 +744,15 @@ namespace arxan::anti_debug
 
 #ifndef NDEBUG
 			auto* get_thread_context_func = utils::nt::library("kernelbase.dll").get_proc<void*>("GetThreadContext");
-			get_thread_context_hook.create(get_thread_context_func, get_thread_context_stub);
+			// get_thread_context_hook.create(get_thread_context_func, get_thread_context_stub);
 #endif
 
-			utils::hook::copy(this->window_text_buffer_, GetWindowTextA, sizeof(this->window_text_buffer_));
-			utils::hook::jump(GetWindowTextA, get_window_text_a_stub, true, true);
-			utils::hook::move_hook(GetWindowTextA);
+			// utils::hook::copy(this->window_text_buffer_, GetWindowTextA, sizeof(this->window_text_buffer_));
+			// utils::hook::jump(GetWindowTextA, get_window_text_a_stub, true, true);
+			// utils::hook::move_hook(GetWindowTextA);
 
 			auto* sys_met_import = utils::nt::library{}.get_iat_entry("user32.dll", "GetSystemMetrics");
-			if (sys_met_import) utils::hook::set(sys_met_import, get_system_metrics_stub);
+			// if (sys_met_import) utils::hook::set(sys_met_import, get_system_metrics_stub);
 
 			const auto nt_set_information_thread = ntdll.get_proc<void*>("NtSetInformationThread");
 			nt_set_information_thread_hook.create(nt_set_information_thread, nt_set_information_thread_stub);
@@ -709,7 +766,7 @@ namespace arxan::anti_debug
 			virtual_alloc_hook.create(virtual_alloc_func, virtual_alloc_stub);
 
 			auto* check_remote_debugger_present_func = utils::nt::library("kernel32.dll").get_proc<void*>("CheckRemoteDebuggerPresent");
-			check_remote_debugger_present_hook.create(check_remote_debugger_present_func, check_remote_debugger_present_stub);
+			// check_remote_debugger_present_hook.create(check_remote_debugger_present_func, check_remote_debugger_present_stub);
 		}
 
 		// post_thread_setup removed, NTDLL copies are now hooked via VEH on execute faults

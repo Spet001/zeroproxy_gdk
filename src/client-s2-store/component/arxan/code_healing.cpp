@@ -216,7 +216,7 @@ namespace arxan::code_healing
 #ifdef ARXAN_DEBUG
 				OutputDebugStringA(utils::string::va("Blocked code healing at: %llX for size: %X\n", game::derelocate(heal_start), patch_length));
 #else
-				LOG("Arxan/CodeHealing", INFO, "Blocked code healing at: {:X} for size: {:X}", game::derelocate(heal_start), patch_length);
+				// LOG("Arxan/CodeHealing", INFO, "Blocked code healing at: {:X} for size: {:X}", game::derelocate(heal_start), patch_length);
 #endif
 				return false;
 			}
