@@ -789,4 +789,4 @@ namespace arxan::integrity
 	};
 }
 
-REGISTER_COMPONENT(arxan::integrity::component)
+// REGISTER_COMPONENT(arxan::integrity::component)

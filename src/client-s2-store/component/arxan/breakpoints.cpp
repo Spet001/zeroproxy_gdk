@@ -160,4 +160,4 @@ utils::hook::detour add_vectored_exception_handler_hook;
 	};
 }
 
-REGISTER_COMPONENT(arxan::breakpoints::component)
+// REGISTER_COMPONENT(arxan::breakpoints::component)

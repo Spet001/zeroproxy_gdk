@@ -1,3 +1,4 @@
+#include <utils/io.hpp>
 #pragma once
 #include "common_core.hpp"
 
@@ -8,6 +9,7 @@
 #include "logger/logger.hpp"
 #include "utils/hook.hpp"
 #include "utils/string.hpp"
+#include "component/scheduler.hpp"
 
 namespace uwp {
 	namespace {
@@ -16,7 +18,7 @@ namespace uwp {
 		utils::hook::detour x_store_query_game_license_result_hook;
 		utils::hook::detour x_user_is_store_user_hook;
 
-		utils::hook::iat_detour get_proc_address_hook;
+
 
 		std::string guid_to_string(GUID guid) {
 			return std::format("{:08x}-{:04x}-{:04x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}", guid.Data1, guid.Data2, guid.Data3,
@@ -90,30 +92,53 @@ namespace uwp {
 			return res;
 		}
 
-		FARPROC get_proc_address_stub(HMODULE h_module, LPCSTR lp_proc_name) {
-			auto res = get_proc_address_hook.invoke<FARPROC>(h_module, lp_proc_name);
-			utils::nt::library lib(h_module);
-			if (lib.is_valid() && utils::string::to_lower(lib.get_name()) == "xgameruntime.dll" && "QueryApiImpl"s == lp_proc_name) {
-				/*
-				 * no, this cannot be an IAT detour because xgameruntime.dll/QueryApiImpl is not directly imported into the game, but
-				 * loaded and imported dynamically after the execution of WinMain, therefore IAT detouring doesn't work and we have to
-				 * hook into GetProcAddress instead to hook this function as soon as it is loaded.
-				 */
-				query_api_impl_hook.create(res, query_api_impl_stub);
+		void hook_query_api() {
+			static bool hooked = false;
+			if (hooked) return;
+
+			utils::nt::library lib("xgameruntime.dll");
+			if (!lib.is_valid()) return;
+
+			auto proc = lib.get_proc<FARPROC>("QueryApiImpl");
+			if (proc) {
+				query_api_impl_hook.create(proc, query_api_impl_stub);
+				hooked = true;
+				LOG("UWP", INFO, "Successfully hooked QueryApiImpl without touching GetProcAddress!");
 			}
-			return res;
 		}
 	}
 
 	struct component final : generic_component {
-		void post_load() override {
-			utils::nt::library game{};
-			if (game.get_iat_entry("XCurl.dll", "curl_multi_poll") == nullptr) {
-				return;
-			}
+		        void post_load() override {
+            utils::nt::library game{};
+            if (game.get_iat_entry("XCurl.dll", "curl_multi_poll") == nullptr) {
+                return;
+            }
 
-			get_proc_address_hook.create(game, "kernel32.dll", "GetProcAddress", get_proc_address_stub);
-		}
+            const char* ini_path = ".\ZeroProxy.ini";
+            if (!utils::io::file_exists(ini_path)) {
+                utils::io::write_file(ini_path, "[Experimental Features]\nLoad XStore from inside ZeroProxy=0\nLoad XStore From a external DLL=1\nDLL Name=XGameRuntime.dll\n");
+            }
+
+            int internal_load = GetPrivateProfileIntA("Experimental Features", "Load XStore from inside ZeroProxy", 0, ini_path);
+            int external_load = GetPrivateProfileIntA("Experimental Features", "Load XStore From a external DLL", 1, ini_path);
+
+            if (external_load) {
+                char buffer[256];
+                GetPrivateProfileStringA("Experimental Features", "DLL Name", "XGameRuntime.dll", buffer, sizeof(buffer), ini_path);
+                HMODULE hMod = LoadLibraryA(buffer);
+                if (hMod) {
+                    LOG("UWP", INFO, "Loaded external XStore DLL: {}", buffer);
+                } else {
+                    LOG("UWP", ERROR, "Failed to load external XStore DLL: {}", buffer);
+                }
+            }
+
+            if (internal_load) {
+                LOG("UWP", INFO, "Internal XStore loader activated.");
+                scheduler::loop(hook_query_api, scheduler::pipeline::async);
+            }
+        }
 	};
 }
 #endif

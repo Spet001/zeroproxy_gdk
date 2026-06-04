@@ -833,4 +833,4 @@ namespace arxan::anti_debug
 	};
 }
 
-REGISTER_COMPONENT(arxan::anti_debug::component)
+// REGISTER_COMPONENT(arxan::anti_debug::component)

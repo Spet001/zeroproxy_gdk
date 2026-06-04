@@ -161,3 +161,7 @@ src/**.vcxproj
 src/**.vcxproj.filters
 src/**.vcxproj.user
 src/generated/
+
+# Py Scripts
+
+*.py

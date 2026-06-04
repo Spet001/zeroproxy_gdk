@@ -417,4 +417,4 @@ namespace arxan::code_healing
 	};
 }
 
-REGISTER_COMPONENT(arxan::code_healing::component)
+// REGISTER_COMPONENT(arxan::code_healing::component)

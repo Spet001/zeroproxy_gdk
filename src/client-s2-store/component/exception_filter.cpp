@@ -23,4 +23,4 @@ namespace exception_filter {
 	};
 }
 
-REGISTER_COMPONENT(exception_filter::component)
+// REGISTER_COMPONENT(exception_filter::component)

@@ -23,7 +23,7 @@ namespace patches {
 		{
 			LPCWSTR lp_window_name_patched = lp_window_name;
 			if (wcscmp(lp_class_name, L"S2") == 0) {
-				lp_window_name_patched = L"s2s by lifix and luxploit | " GIT_DESCRIBE;
+				lp_window_name_patched = L"s2s by Lifix Luxploit and Spet | " GIT_DESCRIBE;
 			}
 
 			return create_window_ex_w_hook.invoke<HWND>(dw_ex_style, lp_class_name, lp_window_name_patched, dw_style, x, y, n_width, n_height, hwnd_parent,
