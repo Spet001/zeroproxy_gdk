@@ -72,28 +72,56 @@ namespace uwp {
             PkgEnumCtx* c = reinterpret_cast<PkgEnumCtx*>(ctx);
             typedef bool(__stdcall* PkgEnumCb_t)(void*, const XPackageDetails*);
             PkgEnumCb_t orig = reinterpret_cast<PkgEnumCb_t>(c->orig_cb);
+            
+            if (details && details->kind == 1 && details->storeId && details->packageIdentifier) {
+                LOG("UWP", INFO, "Intercepted real package enum! ID: {}, StoreID: {}", details->packageIdentifier, details->storeId);
+            }
             return orig(c->orig_ctx, details);
         }
 
         inline HRESULT x_package_enumerate_packages_v8_stub(void* _this, uint32_t kind, uint32_t scope, void* ctx, void* cb) {
+            LOG("UWP", INFO, "XPackageEnumeratePackages called!");
             auto func = reinterpret_cast<HRESULT(__stdcall*)(void*, uint32_t, uint32_t, void*, void*)>(x_package_enumerate_packages_v8_hook.get_original());
             PkgEnumCtx wrapper_ctx = { cb, ctx };
             void* call_cb = cb ? (void*)&hook_pkg_enum_callback : nullptr;
             void* call_ctx = cb ? (void*)&wrapper_ctx : ctx;
-            return func(_this, kind, scope, call_ctx, call_cb);
+            
+            HRESULT hr = func(_this, kind, scope, call_ctx, call_cb);
+
+            if (cb && SUCCEEDED(hr)) {
+                // If the user manually placed DLC files in zone/dlc but didn't download them from the MS Store,
+                // the real XPackageEnumeratePackages will return 0 packages. If 0 packages are returned,
+                // the game will never call XPackageMountWithUiAsync, and thus will never read the zone/dlc folder.
+                // We inject a fake package here to force the game to attempt a mount!
+                XPackageDetails fake_details = {};
+                fake_details.packageIdentifier = "AdvancedWarfare.DLC.Mock";
+                fake_details.storeId = "AdvancedWarfare.DLC.Mock";
+                fake_details.kind = 1; // Content
+                fake_details.displayName = "Advanced Warfare Fake DLC";
+                
+                typedef bool(__stdcall* PkgEnumCb_t)(void*, const XPackageDetails*);
+                PkgEnumCb_t orig_cb = reinterpret_cast<PkgEnumCb_t>(cb);
+                orig_cb(ctx, &fake_details);
+                LOG("UWP", INFO, "Injected fake DLC package into XPackageEnumeratePackages!");
+            }
+
+            return hr;
         }
 
         inline HRESULT x_package_mount_stub(void* _this, const char* package_identifier, void** out_handle) {
+            LOG("UWP", INFO, "XPackageMount called for package: {}", package_identifier ? package_identifier : "null");
             if (out_handle) {
                 void* fake = malloc(0x10);
                 memset(fake, 0, 0x10);
                 *out_handle = fake;
                 fake_mount_handles.insert(fake);
+                LOG("UWP", INFO, "Faked XPackageMount! Injected fake mount handle.");
             }
             return S_OK;
         }
 
         inline HRESULT x_package_mount_with_ui_async_stub(void* _this, const char* package_identifier, uwp::XAsyncBlock* async) {
+            LOG("UWP", INFO, "XPackageMountWithUiAsync called for package: {}", package_identifier ? package_identifier : "null");
             fake_async_blocks.insert(async);
             HANDLE h = CreateThread(nullptr, 0, fake_async_thread, async, 0, nullptr);
             if (h) CloseHandle(h);
@@ -108,6 +136,7 @@ namespace uwp {
                     memset(fake, 0, 0x10);
                     *out_handle = fake;
                     fake_mount_handles.insert(fake);
+                    LOG("UWP", INFO, "Faked XPackageMountWithUiResult! Injected fake mount handle.");
                 }
                 return S_OK;
             }
@@ -123,14 +152,9 @@ namespace uwp {
                     std::string dir(path);
                     auto pos = dir.find_last_of("\\/");
                     dir = (pos != std::string::npos) ? dir.substr(0, pos) : dir;
-                    
-                    std::string dlc_dir = dir + "\\zone\\dlc\\";
-                    if (GetFileAttributesA(dlc_dir.c_str()) != INVALID_FILE_ATTRIBUTES) {
-                        dir = dlc_dir;
-                    } else {
-                        dir += "\\"; // Add trailing slash for safe concatenation
-                    }
+                    dir += "\\"; // Always use base game folder for AW
                     *out_size = dir.size() + 1;
+                    LOG("UWP", INFO, "Faked XPackageGetMountPathSize to: {}", *out_size);
                 }
                 return S_OK;
             }
@@ -146,14 +170,9 @@ namespace uwp {
                     std::string dir(path);
                     auto pos = dir.find_last_of("\\/");
                     dir = (pos != std::string::npos) ? dir.substr(0, pos) : dir;
-
-                    std::string dlc_dir = dir + "\\zone\\dlc\\";
-                    if (GetFileAttributesA(dlc_dir.c_str()) != INVALID_FILE_ATTRIBUTES) {
-                        dir = dlc_dir;
-                    } else {
-                        dir += "\\"; // Add trailing slash for safe concatenation
-                    }
+                    dir += "\\"; // Always use base game folder for AW
                     strncpy_s(out_buf, out_size, dir.c_str(), _TRUNCATE);
+                    LOG("UWP", INFO, "Faked XPackageGetMountPath to: {}", out_buf);
                 }
                 return S_OK;
             }
@@ -181,9 +200,11 @@ namespace uwp {
         inline utils::hook::detour x_store_acquire_license_for_durables_result_hook;
 
         inline HRESULT x_store_acquire_license_for_durables_async_stub(uwp::IStoreImpl1* _this, const uwp::XStoreContextHandle store_context_handle, const char* store_id, uwp::XAsyncBlock* async) {
+            LOG("UWP", INFO, "XStoreAcquireLicenseForDurablesAsync called for StoreId: {}", store_id ? store_id : "null");
             auto func = reinterpret_cast<HRESULT(__stdcall*)(void*, void*, const char*, void*)>(x_store_acquire_license_for_durables_async_hook.get_original());
             HRESULT hr = func(_this, store_context_handle, store_id, async);
             if (FAILED(hr)) {
+                LOG("UWP", INFO, "Synchronous failure! Falling back to FAKE license acquisition for Durables.");
                 fake_async_blocks.insert(async);
                 HANDLE h = CreateThread(nullptr, 0, fake_async_thread, async, 0, nullptr);
                 if (h) CloseHandle(h);
@@ -218,8 +239,7 @@ namespace uwp {
         }
 
         inline HRESULT x_store_acquire_license_for_package_async_stub(uwp::IStoreImpl1* _this, const uwp::XStoreContextHandle store_context_handle, const char* package_identifier, uwp::XAsyncBlock* async) {
-            // FAKE FOR ALL PACKAGES! The async function returns S_OK synchronously even if it fails in the background.
-            // By completely intercepting this, we guarantee the game receives a valid fake license handle!
+            LOG("UWP", INFO, "XStoreAcquireLicenseForPackageAsync called for package: {}", package_identifier ? package_identifier : "null");
             fake_async_blocks.insert(async);
             HANDLE h = CreateThread(nullptr, 0, fake_async_thread, async, 0, nullptr);
             if (h) CloseHandle(h);
@@ -269,10 +289,12 @@ namespace uwp {
                 }
             }
             auto* c = reinterpret_cast<ProductsCbCtx*>(ctx);
+            LOG("UWP", INFO, "XStoreProduct patched! title={} storeId={}", p->title_ ? p->title_ : "null", p->store_id_ ? p->store_id_ : "null");
             return c->userCb ? c->userCb(product, c->userCtx) : true;
         }
 
         inline HRESULT x_store_enumerate_products_query_stub(uwp::IStoreImpl1* _this, const uwp::XStoreProductQueryHandle product_query_handle, void* context, bool(*callback)(const uwp::XStoreProduct*, void*)) {
+            LOG("UWP", INFO, "XStoreEnumerateProductsQuery called!");
             ProductsCbCtx cbCtx;
             cbCtx.userCb = callback;
             cbCtx.userCtx = context;
@@ -294,6 +316,19 @@ namespace uwp {
         }
 
         inline HRESULT x_store_query_entitled_products_async_stub(uwp::IStoreImpl1* _this, const uwp::XStoreContextHandle store_context_handle, uwp::XStoreProductKind product_kinds, std::uint32_t max_items_to_retrieve_per_page, uwp::XAsyncBlock* async) {
+            uint32_t kinds = (uint32_t)product_kinds;
+            LOG("UWP", INFO, "XStoreQueryEntitledProductsAsync called with product_kinds: {}", kinds);
+            
+            // XStoreProductKind::Game is 0x04. If the game is querying for its own base license, we MUST let it through to the real API.
+            // If we redirect it to QueryAssociatedProductsAsync, it will return nothing (a game is not an associated product of itself),
+            // causing the game to fail its base entitlement check and disable DLCs.
+            if ((kinds & 4) != 0) {
+                LOG("UWP", INFO, "Letting Game (0x04) entitlement query go to real API...");
+                auto func = reinterpret_cast<HRESULT(__stdcall*)(void*, void*, uint32_t, uint32_t, void*)>(x_store_query_entitled_products_async_hook.get_original());
+                return func(_this, (void*)store_context_handle, kinds, max_items_to_retrieve_per_page, async);
+            }
+
+            LOG("UWP", INFO, "Intercepted XStoreQueryEntitledProductsAsync! Redirecting to XStoreQueryAssociatedProductsAsync...");
             auto func = get_vt_function(_this, 5); // QueryAssociatedProductsAsync
             typedef HRESULT(__stdcall* QueryAssociatedT)(uwp::IStoreImpl1*, uwp::XStoreContextHandle, uwp::XStoreProductKind, std::uint32_t, uwp::XAsyncBlock*);
             return ((QueryAssociatedT)func)(_this, store_context_handle, product_kinds, max_items_to_retrieve_per_page, async);
@@ -346,43 +381,72 @@ namespace uwp {
         }
     }
 
+    inline utils::hook::detour query_api_impl_hook;
+
+    inline std::string guid_to_string(GUID guid) {
+        return std::format("{:08x}-{:04x}-{:04x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}", guid.Data1, guid.Data2, guid.Data3,
+            guid.Data4[0], guid.Data4[1], guid.Data4[2], guid.Data4[3], guid.Data4[4], guid.Data4[5], guid.Data4[6], guid.Data4[7]);
+    }
+
+    inline bool is_target_api(GUID guid_first, GUID guid_second, const std::string& guid_first_target, const std::string& guid_second_target) {
+        return guid_to_string(guid_first) == guid_first_target && guid_to_string(guid_second) == guid_second_target;
+    }
+
+    inline HRESULT query_api_impl_stub(GUID* first, GUID* second, void** api_out) {
+        auto res = query_api_impl_hook.invoke<HRESULT>(first, second, api_out);
+
+        if (first != nullptr && second != nullptr && res >= 0 && api_out && *api_out) {
+            static bool hooked_pkg_vt = false;
+            static bool hooked_store_vt = false;
+
+            if (!hooked_pkg_vt && is_target_api(*first, *second, "af406016-e850-4aa8-a88d-2f3dcb9dac7e", "e2a4734b-2f4a-456d-aa8f-d065e04fb209")) {
+                LOG("UWP", INFO, "Game requested XPackage API! Hooking XPackage interfaces...");
+                x_package::x_package_enumerate_packages_v8_hook.create(get_vt_function(*api_out, 39), x_package::x_package_enumerate_packages_v8_stub);
+                x_package::x_package_mount_hook.create(get_vt_function(*api_out, 36), x_package::x_package_mount_stub);
+                x_package::x_package_mount_with_ui_async_hook.create(get_vt_function(*api_out, 37), x_package::x_package_mount_with_ui_async_stub);
+                x_package::x_package_mount_with_ui_result_hook.create(get_vt_function(*api_out, 38), x_package::x_package_mount_with_ui_result_stub);
+                x_package::x_package_get_mount_path_size_hook.create(get_vt_function(*api_out, 24), x_package::x_package_get_mount_path_size_stub);
+                x_package::x_package_get_mount_path_hook.create(get_vt_function(*api_out, 25), x_package::x_package_get_mount_path_stub);
+                x_package::x_package_close_mount_handle_hook.create(get_vt_function(*api_out, 26), x_package::x_package_close_mount_handle_stub);
+                hooked_pkg_vt = true;
+            }
+
+            if (!hooked_store_vt && is_target_api(*first, *second, "0dd112ac-7c24-448c-b92b-3960fb5bd30c", "5c48dedf-0b67-4492-a4b5-6829b8e796e1")) {
+                LOG("UWP", INFO, "Game requested XStore API! Hooking XStore interfaces...");
+                x_store::x_store_query_entitled_products_async_hook.create(get_vt_function(*api_out, 9), x_store::x_store_query_entitled_products_async_stub);
+                x_store::x_store_enumerate_products_query_hook.create(get_vt_function(*api_out, 15), x_store::x_store_enumerate_products_query_stub);
+                x_store::x_store_acquire_license_for_package_async_hook.create(get_vt_function(*api_out, 20), x_store::x_store_acquire_license_for_package_async_stub);
+                x_store::x_store_acquire_license_for_package_result_hook.create(get_vt_function(*api_out, 21), x_store::x_store_acquire_license_for_package_result_stub);
+                x_store::x_store_license_is_valid_hook.create(get_vt_function(*api_out, 22), x_store::x_store_license_is_valid_stub);
+                x_store::x_store_close_license_handle_hook.create(get_vt_function(*api_out, 23), x_store::x_store_close_license_handle_stub);
+                x_store::x_store_query_game_license_result_hook.create(get_vt_function(*api_out, 29), x_store::x_store_query_game_license_result_stub);
+                x_store::x_store_acquire_license_for_durables_async_hook.create(get_vt_function(*api_out, 30), x_store::x_store_acquire_license_for_durables_async_stub);
+                x_store::x_store_acquire_license_for_durables_result_hook.create(get_vt_function(*api_out, 31), x_store::x_store_acquire_license_for_durables_result_stub);
+                hooked_store_vt = true;
+            }
+        }
+        return res;
+    }
+
     inline void init_standalone_hooks() {
+        static bool is_query_api_hooked = false;
+        if (is_query_api_hooked) return;
+
+        LOG("UWP", INFO, "Waiting to hook QueryApiImpl...");
         utils::nt::library lib("xgameruntime.dll");
-        if (!lib.is_valid()) return;
-
-        auto query_api_impl = lib.get_proc<HRESULT(__stdcall*)(GUID*, GUID*, void**)>("QueryApiImpl");
-        if (!query_api_impl) return;
-
-        // Fetch XPackage Interface
-        void* pkg_api = nullptr;
-        GUID pkg_first =  { 0xaf406016, 0xe850, 0x4aa8, { 0xa8, 0x8d, 0x2f, 0x3d, 0xcb, 0x9d, 0xac, 0x7e } };
-        GUID pkg_second = { 0xe2a4734b, 0x2f4a, 0x456d, { 0xaa, 0x8f, 0xd0, 0x65, 0xe0, 0x4f, 0xb2, 0x09 } };
-        
-        if (SUCCEEDED(query_api_impl(&pkg_first, &pkg_second, &pkg_api)) && pkg_api) {
-            x_package::x_package_enumerate_packages_v8_hook.create(get_vt_function(pkg_api, 39), x_package::x_package_enumerate_packages_v8_stub);
-            x_package::x_package_mount_hook.create(get_vt_function(pkg_api, 36), x_package::x_package_mount_stub);
-            x_package::x_package_mount_with_ui_async_hook.create(get_vt_function(pkg_api, 37), x_package::x_package_mount_with_ui_async_stub);
-            x_package::x_package_mount_with_ui_result_hook.create(get_vt_function(pkg_api, 38), x_package::x_package_mount_with_ui_result_stub);
-            x_package::x_package_get_mount_path_size_hook.create(get_vt_function(pkg_api, 24), x_package::x_package_get_mount_path_size_stub);
-            x_package::x_package_get_mount_path_hook.create(get_vt_function(pkg_api, 25), x_package::x_package_get_mount_path_stub);
-            x_package::x_package_close_mount_handle_hook.create(get_vt_function(pkg_api, 26), x_package::x_package_close_mount_handle_stub);
+        if (!lib.is_valid()) {
+            LOG("UWP", INFO, "Failed to find xgameruntime.dll!");
+            return;
         }
 
-        // Fetch XStore Interface
-        void* store_api = nullptr;
-        GUID store_first =  { 0x0dd112ac, 0x7c24, 0x448c, { 0xb9, 0x2b, 0x39, 0x60, 0xfb, 0x5b, 0xd3, 0x0c } };
-        GUID store_second = { 0x5c48dedf, 0x0b67, 0x4492, { 0xa4, 0xb5, 0x68, 0x29, 0xb8, 0xe7, 0x96, 0xe1 } };
-
-        if (SUCCEEDED(query_api_impl(&store_first, &store_second, &store_api)) && store_api) {
-            x_store::x_store_query_entitled_products_async_hook.create(get_vt_function(store_api, 9), x_store::x_store_query_entitled_products_async_stub);
-            x_store::x_store_enumerate_products_query_hook.create(get_vt_function(store_api, 15), x_store::x_store_enumerate_products_query_stub);
-            x_store::x_store_acquire_license_for_package_async_hook.create(get_vt_function(store_api, 20), x_store::x_store_acquire_license_for_package_async_stub);
-            x_store::x_store_acquire_license_for_package_result_hook.create(get_vt_function(store_api, 21), x_store::x_store_acquire_license_for_package_result_stub);
-            x_store::x_store_license_is_valid_hook.create(get_vt_function(store_api, 22), x_store::x_store_license_is_valid_stub);
-            x_store::x_store_close_license_handle_hook.create(get_vt_function(store_api, 23), x_store::x_store_close_license_handle_stub);
-            x_store::x_store_query_game_license_result_hook.create(get_vt_function(store_api, 29), x_store::x_store_query_game_license_result_stub);
-            x_store::x_store_acquire_license_for_durables_async_hook.create(get_vt_function(store_api, 30), x_store::x_store_acquire_license_for_durables_async_stub);
-            x_store::x_store_acquire_license_for_durables_result_hook.create(get_vt_function(store_api, 31), x_store::x_store_acquire_license_for_durables_result_stub);
+        auto query_api_impl = lib.get_proc<FARPROC>("QueryApiImpl");
+        if (!query_api_impl) {
+            LOG("UWP", INFO, "Failed to find QueryApiImpl!");
+            return;
         }
+
+        query_api_impl_hook.create(query_api_impl, query_api_impl_stub);
+        is_query_api_hooked = true;
+        LOG("UWP", INFO, "Successfully hooked QueryApiImpl!");
     }
 }
