@@ -32,7 +32,7 @@ Call of Duty®: Black Ops II (2012)
 \- t6s (<img height="15px" src="assets/github/microsoft.svg" />) / t6-mod (<img height="15px" src="assets/github/steam.svg" />) - works partially<br/>
 Call of Duty®: Ghosts (2013)
 <a href="https://apps.microsoft.com/detail/9PJH49B6K7DD"><img height="15px" src="assets/github/microsoft.svg" /></a>
-\- iw6s (<img height="15px" src="assets/github/microsoft.svg" />) - not implemented yet (but will likely use the same logic as s1s)<br/>
+\- iw6s (<img height="15px" src="assets/github/microsoft.svg" />) - not implemented yet (but will likely use the same logic as s1s, if you use s1s DLL in Ghosts it will also work anyway)<br/>
 Call of Duty®: Advanced Warfare (2014)
 <a href="https://apps.microsoft.com/detail/9p9m46g36k6w"><img height="15px" src="assets/github/microsoft.svg" /></a>
 \- s1s (<img height="15px" src="assets/github/microsoft.svg" />) - works and has all DLCs unlocked<br/>
